@@ -37,6 +37,17 @@ const memberFetchState = new Map()
 let memberFetchQueue = Promise.resolve()
 let lastMemberFetch = 0
 
+function getMemberScan(guildId) {
+    return memberFetchState.get(guildId)?.members || null
+}
+function getMemberScanStatus(guildId) {
+    const state = memberFetchState.get(guildId)
+    return {
+        complete: Boolean(state?.complete),
+        scanning: Boolean(state?.promise)
+    }
+}
+
 // create client
 const client = new Discord.Client({
     allowedMentions: { parse: ["users"] },
@@ -52,6 +63,9 @@ if (!client.shard) {
 }
 
 client.shard.id = client.shard.ids[0]
+
+client.getMemberScan = getMemberScan
+client.getMemberScanStatus = getMemberScanStatus
 
 client.globalTools = new Tools(client);
 
@@ -74,10 +88,12 @@ function fetchMembersForMaintenance(guild) {
     if (cached?.promise) return cached.promise
 
     const state = cached || {}
+    state.members = new Map()
+    state.complete = false
     const request = memberFetchQueue.then(async () => {
         const spacing = memberFetchSpacing - (Date.now() - lastMemberFetch)
         if (spacing > 0) await wait(spacing)
-        const members = new Map()
+        const members = state.members
         let after = "0"
         let batchCount = 0
 
@@ -85,6 +101,10 @@ function fetchMembersForMaintenance(guild) {
             batchCount++
             const batch = await guild.members.list({ limit: memberFetchBatchSize, after })
             batch.forEach((member, id) => members.set(id, member))
+            logImportant(
+                `Escaneo de **${guild.name}**: registrados **${members.size}** miembros hasta ahora.`
+            ).catch(() => {})
+            client.emit("memberScanProgress", guild.id)
             if (batch.size < memberFetchBatchSize) break
 
             const nextAfter = batch.lastKey()
@@ -94,9 +114,11 @@ function fetchMembersForMaintenance(guild) {
         }
 
         lastMemberFetch = Date.now()
-        state.members = members
         state.timestamp = lastMemberFetch
         state.complete = members.size >= guild.memberCount
+        logImportant(
+            `Escaneo de **${guild.name}** completado: **${members.size}/${guild.memberCount}** miembros.`
+        ).catch(() => {})
         console.info(`Maintenance member scan for ${guild.name}: ${members.size}/${guild.memberCount} members in ${batchCount} batches`)
         return members
     }).catch(error => {
@@ -407,6 +429,12 @@ client.on("clientReady", () => {
     client.updateStatus()
     setInterval(client.updateStatus, 15 * 60000);
 
+    for (const guild of client.guilds.cache.values()) {
+        fetchMembersForMaintenance(guild).catch(error => {
+            console.warn(`Could not warm member cache for ${guild.id}:`, error.message)
+        })
+    }
+
     const cleanupDelay = 30_000 + Math.floor(Math.random() * 90_000)
     setTimeout(() => {
         cleanAllGuilds()
@@ -482,8 +510,23 @@ client.on("interactionCreate", async int => {
     if (foundCommand.metadata.dev && !tools.isDev()) return tools.warn("Only developers can use this!")
     else if (config.lockBotToDevOnly && !tools.isDev()) return tools.warn("Only developers can use this bot!")
 
-    try { await foundCommand.run(client, int, tools) }
-    catch(e) { console.error(e); int.reply({ content: "**Error!** " + e.message, ephemeral: true }) }
+    try {
+        await foundCommand.run(client, int, tools)
+    } catch (e) {
+        console.error(e)
+
+        const errorReply = {
+            content: "**Error!** " + e.message,
+            ephemeral: true
+        }
+
+        try {
+            if (int.replied || int.deferred) await int.followUp(errorReply)
+            else await int.reply(errorReply)
+        } catch (replyError) {
+            console.error("Could not send interaction error reply:", replyError)
+        }
+    }
 })
 
 client.on('error', e => console.warn(e))

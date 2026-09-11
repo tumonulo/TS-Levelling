@@ -17,6 +17,34 @@ function getCurrentSpanishMonth() {
     }).format(new Date())
 }
 
+// Ancho aproximado (en "unidades visuales") disponible antes de que Discord
+// parta la línea en dos en una pantalla de móvil estrecha. Es una estimación
+// -Discord no da un valor exacto y la fuente no es monoespaciada- pensada
+// para quedar con margen de sobra en la mayoría de móviles.
+const MOBILE_LINE_WIDTH = 57
+const MONTHLY_LINE_WIDTH = 53
+// Un emoji personalizado (<:nombre:id>) se ve como un solo icono pequeño,
+// pero como texto pesa muchísimo más que eso: lo tratamos como si ocupara
+// el ancho de 2 caracteres normales a la hora de medir.
+const CUSTOM_EMOJI_VISUAL_WIDTH = 2
+
+function estimateVisualWidth(text) {
+    return text.replace(/<a?:\w+:\d+>/g, "*".repeat(CUSTOM_EMOJI_VISUAL_WIDTH)).length
+}
+
+// Recibe variantes del mismo texto de la más completa a la más corta y
+// devuelve la primera que quepa en MOBILE_LINE_WIDTH. Si ni la más corta
+// cabe, se devuelve igualmente esa (mejor esfuerzo).
+function fitLine(...variants) {
+    return variants.find(variant => estimateVisualWidth(variant) <= MOBILE_LINE_WIDTH)
+        ?? variants[variants.length - 1]
+}
+
+function fitMonthlyLine(...variants) {
+    return variants.find(variant => estimateVisualWidth(variant) <= MONTHLY_LINE_WIDTH)
+        ?? variants[variants.length - 1]
+}
+
 module.exports = {
 metadata: {
     name: "top",
@@ -36,12 +64,9 @@ async run(client, int, tools) {
     else if (db.settings.leaderboard.disabled) return tools.warn("The leaderboard is disabled in this server!" + (tools.canManageServer(int.member) ? `\nAs a moderator, you can still privately view the leaderboard here: ${lbLink}` : ""))
 
     if (client.monthlyMaintenance) {
-        try {
-            await client.monthlyMaintenance(int.guild, db)
-            db = await tools.fetchAll()
-        } catch (error) {
+        client.monthlyMaintenance(int.guild, db).catch(error => {
             console.warn(`Could not update monthly leaderboard for ${int.guild.id}:`, error.message)
-        }
+        })
     }
 
     let pageSize = 8
@@ -79,8 +104,24 @@ async run(client, int, tools) {
             : configuredColor)
         : tools.COLOR
 
-    const buildContainer = page => {
+    const resolvedMembers = new Map()
+
+    // Fetches only the members not already cached/resolved, in a single
+    // batched request per page instead of one force-fetch per member.
+    const resolvePageMembers = async userIds => {
+        const missing = userIds.filter(id => !resolvedMembers.has(id))
+        if (!missing.length) return
+
+        const fetched = await int.guild.members.fetch({ user: missing }).catch(() => new Map())
+        missing.forEach(id => resolvedMembers.set(id, fetched.get(id) ?? null))
+    }
+
+    const buildContainer = async page => {
         const pageData = rankings.slice((page - 1) * pageSize, page * pageSize)
+        const pageUserIds = pageData.map(entry => String(entry.id))
+
+        await resolvePageMembers(pageUserIds)
+
         const entryComponents = []
         const pageRankCounts = new Map()
         const getRankInfo = entry => {
@@ -104,24 +145,42 @@ async run(client, int, tools) {
 
         pageData.forEach((entry, index) => {
             const position = (page - 1) * pageSize + index + 1
+            const userId = String(entry.id)
             const isHighlighted = entry.id === highlight
             const isRequester = entry.id === int.user.id
             const { level, rankRole } = pageRankInfo[index]
             const totalMessages = tools.commafy(tools.getMessages(entry))
             const monthlyMessages = tools.commafy(tools.getMonthlyMessages(entry))
             const monthlyXP = tools.commafy(tools.getMonthlyXP(entry))
-            const searchedMember = isHighlighted ? int.guild.members.cache.get(entry.id) : null
-            const searchedMemberName = searchedMember?.displayName || userSearch?.member?.displayName || userSearch?.user?.username
+            const member = resolvedMembers.get(userId)
+            const user = member?.user || client.users.cache.get(userId)
+            const displayName = member?.displayName || user?.globalName || user?.username
+            const memberDisplay = member
+                ? `<@${userId}>`
+                : `<@${userId}>  🚪`
+            const searchedMemberName = displayName || "Miembro"
             const memberMarker = isHighlighted && !isRequester
                 ? `  <:member:1467596629787021415>** ${searchedMemberName || "Miembro"}**`
                 : isRequester
                     ? "  <:member:1467596629787021415> **Tú**"
                     : ""
             entryComponents.push(new TextDisplayBuilder().setContent([
-                `${rankRole?.emoji || "<:top:1467967277251956887>"} **#${position} - Nivel ${level} - <@${entry.id}>**${memberMarker}`,
+                `${rankRole?.emoji || "<:top:1467967277251956887>"} **#${position} - Nivel ${level} - ${memberDisplay}**${memberMarker}`,
                 monthlyMode
-                    ? `-# <:messages:1467163578699354235> **${monthlyMessages}** este mes  -  <:XP:1467192533812645939> **${monthlyXP}** XP este mes`
-                    : `-# <:messages:1467163578699354235> **${totalMessages}** mensajes totales  -  <:messages:1467163578699354235> **${monthlyMessages}** este mes`
+                    ? fitMonthlyLine(
+                        `-# <:messages:1467163578699354235> **${monthlyMessages}** mensajes este mes  -  <:XP:1467192533812645939> **${monthlyXP}** XP este mes`,
+                        `-# <:messages:1467163578699354235> **${monthlyMessages}** msjs este mes  -  <:XP:1467192533812645939> **${monthlyXP}** XP este mes`,
+                        `-# <:messages:1467163578699354235> **${monthlyMessages}** msjs mes  -  <:XP:1467192533812645939> **${monthlyXP}** XP mes`,
+                        `-# <:messages:1467163578699354235> **${monthlyMessages}** msg  -  <:XP:1467192533812645939> **${monthlyXP}** XP`,
+                        `-# <:messages:1467163578699354235> **${monthlyMessages}**  -  <:XP:1467192533812645939> **${monthlyXP}**`
+                    )
+                    : fitLine(
+                        `-# <:messages:1467163578699354235> **${totalMessages}** mensajes totales  -  <:messages:1467163578699354235> **${monthlyMessages}** este mes`,
+                        `-# <:messages:1467163578699354235> **${totalMessages}** msjs totales  -  <:messages:1467163578699354235> **${monthlyMessages}** este mes`,
+                        `-# <:messages:1467163578699354235> **${totalMessages}** msjs totales  -  <:messages:1467163578699354235> **${monthlyMessages}** mes`,
+                        `-# <:messages:1467163578699354235> **${totalMessages}** msjs  -  <:messages:1467163578699354235> **${monthlyMessages}** mes`,
+                        `-# <:messages:1467163578699354235> **${totalMessages}**  -  <:messages:1467163578699354235> **${monthlyMessages}**`
+                    )
             ].join("\n")))
 
             if (index < pageData.length - 1) {
@@ -161,7 +220,7 @@ async run(client, int, tools) {
         const container = new ContainerBuilder()
             .setAccentColor(pageAccentColor || tools.COLOR)
             .addTextDisplayComponents(new TextDisplayBuilder().setContent([
-                `## <:top:1467967277251956887> ${monthlyMode ? `Top de ${getCurrentSpanishMonth().charAt(0).toUpperCase() + getCurrentSpanishMonth().slice(1)}` : "Top"} de ${int.guild.name}`
+                `# <:top:1467967277251956887> ${monthlyMode ? `Top de ${getCurrentSpanishMonth().charAt(0).toUpperCase() + getCurrentSpanishMonth().slice(1)}` : "Top"} de ${int.guild.name}`
             ].join("\n")))
 
         container.addSeparatorComponents(new SeparatorBuilder()
@@ -173,23 +232,38 @@ async run(client, int, tools) {
             else container.addTextDisplayComponents(component)
         })
 
-        return container
-            .addSeparatorComponents(new SeparatorBuilder()
-                .setDivider(true)
-                .setSpacing(SeparatorSpacingSize.Small))
-            .addTextDisplayComponents(new TextDisplayBuilder().setContent(
-                `-# Página **${page}** de **${totalPages}**  -  ${memberRange}`))
-            .addActionRowComponents(new ActionRowBuilder().addComponents(navigation))
+        return {
+            container: container
+                .addSeparatorComponents(new SeparatorBuilder()
+                    .setDivider(true)
+                    .setSpacing(SeparatorSpacingSize.Small))
+                .addTextDisplayComponents(new TextDisplayBuilder().setContent(
+                    `-# Página **${page}** de **${totalPages}**  -  ${memberRange}`))
+                .addActionRowComponents(new ActionRowBuilder().addComponents(navigation)),
+            pageUserIds
+        }
     }
 
     if (pageNumber < 1 || pageNumber > totalPages) return tools.warn("There are no members on this page!")
 
-    let container = buildContainer(pageNumber)
-    await int.reply({
-        components: [container],
-        flags: MessageFlags.IsComponentsV2 | (isHidden ? MessageFlags.Ephemeral : 0),
-        allowedMentions: { parse: [] },
+    await int.deferReply({
+        flags: MessageFlags.IsComponentsV2 | (isHidden ? MessageFlags.Ephemeral : 0)
     })
+
+    const sendPage = async page => {
+        const { container, pageUserIds } = await buildContainer(page)
+
+        // Se incluye SIEMPRE a los usuarios de la página como mención real,
+        // para que se resuelvan bien en cualquier dispositivo, pero con
+        // SuppressNotifications para que no llegue push/sonido.
+        await int.editReply({
+            components: [container],
+            flags: MessageFlags.IsComponentsV2 | MessageFlags.SuppressNotifications,
+            allowedMentions: { users: pageUserIds, parse: [] },
+        })
+    }
+
+    await sendPage(pageNumber)
     const message = await int.fetchReply()
 
     let buttonPressed = false
@@ -211,8 +285,7 @@ async run(client, int, tools) {
         }
 
         try {
-            container = buildContainer(pageNumber)
-            await int.editReply({ components: [container], allowedMentions: { parse: [] } })
+            await sendPage(pageNumber)
         } finally {
             buttonPressed = false
         }
