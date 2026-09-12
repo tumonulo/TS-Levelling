@@ -51,7 +51,6 @@ async run(client, int, tools) {
         ])
 
         client.db.update(int.guild.id, { $set: { [`settings.multipliers.${typeIndex}`]: newList[typeIndex], 'info.lastUpdate': Date.now() }}).then(() => {
-            client.invalidateServerCache(int.guild.id)
             return int.reply({ content: msg, components: viewMultipliers })        
         })
     }

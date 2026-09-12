@@ -16,7 +16,6 @@ async run(client, int, tools) {
     if (enabled == settings.enabled) return tools.warn(`XP is already ${enabled ? "enabled" : "disabled"} in this server!`)
 
     client.db.update(int.guild.id, { $set: { 'settings.enabled': enabled, 'info.lastUpdate': Date.now() }}).then(() => {
-        client.invalidateServerCache(int.guild.id)
         int.reply(`✅ **XP is now ${enabled ? "enabled" : "disabled"} in this server!**`)
     }).catch(() => tools.warn("Something went wrong while trying to toggle XP!"))
 }}

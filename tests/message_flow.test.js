@@ -5,8 +5,9 @@ const LevelUpMessage = require("../classes/LevelUpMessage.js")
 const NewMessage = require("../commands/events/message.js")
 const Tools = require("../classes/Tools.js")
 
-// freeze the clock so cooldown/xp writes are bit-identical between the two runs
+// freeze the clock so cooldown/xp writes are deterministic
 Date.now = () => 1_700_000_000_000
+const NOW = Date.now()
 
 // ---------------------------------------------------------------
 // Fake in-memory MongoDB model (dotted paths, $set/$inc/$unset)
@@ -60,32 +61,6 @@ function unsetPath(obj, path) {
     delete cur[segs[segs.length - 1]]
 }
 
-function pickPaths(doc, filterKeys) {
-    const result = { _id: doc._id }
-    for (const key of filterKeys) {
-        if (!key.includes(".")) {
-            result[key] = doc[key]
-            continue
-        }
-        const segs = key.split(".")
-        if (doc[segs[0]] === undefined || typeof doc[segs[0]] !== "object") continue
-        let src = doc[segs[0]]
-        let target = result[segs[0]] = {}
-        for (let i = 1; i < segs.length - 1; i++) {
-            if (src[segs[i]] === undefined) break
-            src = src[segs[i]]
-            if (typeof src !== "object") break
-            target = target[segs[i]] = {}
-        }
-        if (src !== undefined && src !== null && typeof src === "object" && src[segs[segs.length - 1]] !== undefined) {
-            target[segs[segs.length - 1]] = src[segs[segs.length - 1]]
-        } else if (typeof src !== "object" && segs.length === 2) {
-            target[segs[1]] = src
-        }
-    }
-    return result
-}
-
 function createFakeDb(overrides = {}) {
     const doc = {
         _id: "g1",
@@ -95,15 +70,12 @@ function createFakeDb(overrides = {}) {
     }
     if (overrides.settings) Object.assign(doc.settings, deepClone(overrides.settings))
     if (overrides.users) Object.assign(doc.users, deepClone(overrides.users))
+    if (overrides.info) Object.assign(doc.info, deepClone(overrides.info))
     if (overrides.enabled !== undefined) doc.settings.enabled = overrides.enabled
     return {
         doc,
-        fetch: (id, filter) => ({
-            exec: async () => {
-                if (!filter) return doc
-                const keys = Array.isArray(filter) ? filter.filter(Boolean) : Object.keys(filter)
-                return pickPaths(doc, keys)
-            }
+        fetch: (id) => ({
+            exec: async () => deepClone(doc)
         }),
         update: (id, data) => ({
             exec: async () => {
@@ -122,136 +94,26 @@ function createFakeDb(overrides = {}) {
     }
 }
 
-// The index.js helpers reproduced with the same logic (per-guild 15s meta cache)
-function makeServerMetaMethods(db) {
-    const cache = new Map()
-    const TTL = 15 * 1000
-    return {
-        fetchMessageData: async (guildId) => {
-            const entry = cache.get(guildId)
-            if (entry && Date.now() - entry.timestamp < TTL) {
-                return { settings: entry.meta.settings, info: entry.meta.info, users: undefined, full: null }
-            }
-            let server = await db.fetch(guildId).exec()
-            if (!server) {
-                await db.create({ _id: guildId })
-                server = await db.fetch(guildId).exec()
-            }
-            cache.set(guildId, { timestamp: Date.now(), meta: { settings: server?.settings, info: server?.info } })
-            return { settings: server?.settings, info: server?.info, users: server?.users, full: server }
-        },
-        fetchUserData: async (guildId, userId) => db.fetch(guildId, { [`users.${userId}`]: 1 }).exec(),
-        invalidateServerCache: (guildId) => cache.delete(guildId)
-    }
-}
+// ---------------------------------------------------------------
+// Harness: the real handler, stubbed tools/client/message
+// ---------------------------------------------------------------
+let levelUpSends = 0
+LevelUpMessage.prototype.send = function () { levelUpSends++ }
 
-// The ORIGINAL message handler, verbatim in behaviour from HEAD
-async function runOld(client, message, tools) {
-    const config = require("../config.json")
-    if (config.lockBotToDevOnly && !tools.isDev(message.author)) return
-
-    const author = message.author.id
-    let db = await tools.fetchSettings(author, message.guild.id)
-    if (!db || !db.settings?.enabled) return
-
-    await client.monthlyMaintenance(message.guild, db)
-    db = await tools.fetchSettings(author, message.guild.id)
-
-    const settings = db.settings
-    let userData = db.users[author] || { xp: 0, cooldown: 0 }
-
-    await client.db.update(message.guild.id, {
-        $inc: {
-            [`users.${author}.messages`]: 1,
-            [`users.${author}.monthlyMessages`]: 1
-        }
-    }).exec()
-
-    const milestoneRoleId = config.roles?.milestones?.id
-    if (milestoneRoleId) {
-        const role = message.guild.roles.cache.get(milestoneRoleId)
-        if (role && !message.member.roles.cache.has(milestoneRoleId)) {
-            message.member.roles.add(role).catch(() => {})
-        }
-    }
-
-    if (userData.cooldown > Date.now()) return
-
-    const multiplierData = tools.getMultiplier(message.member, settings, message.channel)
-    if (multiplierData.multiplier <= 0) return
-
-    const oldXP = userData.xp
-    const xpRange = [settings.gain.min, settings.gain.max].map(x => Math.round(x * multiplierData.multiplier))
-    const xpGained = tools.rng(...xpRange)
-
-    if (xpGained > 0) userData.xp += Math.round(xpGained)
-    else return
-
-    const awardedXP = Math.round(xpGained)
-    userData.xp = oldXP + awardedXP
-
-    if (settings.gain.time > 0) userData.cooldown = Date.now() + (settings.gain.time * 1000)
-    if (userData.hidden) userData.hidden = false
-
-    client.db.update(message.guild.id, {
-        $set: {
-            [`users.${author}.xp`]: userData.xp,
-            [`users.${author}.cooldown`]: userData.cooldown,
-            [`users.${author}.hidden`]: userData.hidden || false
-        },
-        $inc: { [`users.${author}.monthlyXP`]: awardedXP }
-    }).exec()
-
-    const oldLevel = tools.getLevel(oldXP, settings)
-    const newLevel = tools.getLevel(userData.xp, settings)
-    const levelUp = newLevel > oldLevel
-
-    const syncMode = settings.rewardSyncing.sync
-    if (syncMode == "xp" || (syncMode == "level" && levelUp)) {
-        const roleCheck = tools.checkLevelRoles(message.guild.roles.cache, message.member.roles.cache, newLevel, settings.rewards, null, oldLevel)
-        tools.syncLevelRoles(message.member, roleCheck).catch(() => {})
-    }
-
-    if (levelUp && settings.levelUp.enabled && settings.levelUp.message) {
-        const useMultiple = (settings.levelUp.multiple > 1 && (settings.levelUp.multipleUntil == 0 || (newLevel < settings.levelUp.multipleUntil)))
-        if (!useMultiple || (newLevel % settings.levelUp.multiple == 0)) {
-            const lvlMessage = new LevelUpMessage(settings, message, { oldLevel, level: newLevel, userData })
-            lvlMessage.send()
-        }
-    }
-}
-
-// reference linear getLevel (exact HEAD behaviour)
-function linearGetLevel(xp, settings, returnRequirement) {
-    let lvl = 0
-    let previousLevel = 0
-    let xpRequired = 0
-    while (xp >= xpRequired && lvl <= settings.maxLevel) {
-        lvl++
-        previousLevel = xpRequired
-        xpRequired = xpForLevelRef(lvl, settings)
-    }
-    lvl--
-    return returnRequirement ? { level: lvl, xpRequired, previousLevel } : lvl
-}
-function xpForLevelRef(lvl, settings) {
-    if (lvl > settings.maxLevel) lvl = settings.maxLevel
-    const xpRequired = Object.entries(settings.curve).reduce((total, n) => total + (n[1] * (lvl ** n[0])), 0)
-    return settings.rounding > 1 ? settings.rounding * Math.round(xpRequired / settings.rounding) : Math.round(xpRequired)
-}
-
-function makeTools({ db, getLevelImpl, banRoleId, multiplier } = {}) {
-    const getLevel = getLevelImpl || Tools.global.getLevel
+function makeTools(db, { banRoleId, multiplier } = {}) {
     return {
         isDev: () => false,
+        // mirrors Tools.fetchSettings: settings + the author's user entry
         fetchSettings: async (userId, serverId) => {
-            let data = await db.fetch(serverId, ["settings", userId ? `users.${userId}` : null]).exec()
-            data = await db.fetch(serverId).exec()
-            if (!data) {
+            const server = await db.fetch(serverId).exec()
+            if (!server) {
                 await db.create({ _id: serverId })
-                return makeTools({ db, getLevelImpl, banRoleId }).fetchSettings(userId, serverId)
+                return makeTools(db, { banRoleId, multiplier }).fetchSettings(userId, serverId)
             }
-            if (!data.users) data.users = {}
+            const data = { _id: server._id, settings: server.settings, users: {} }
+            if (userId && server.users && server.users[userId] !== undefined) {
+                data.users[userId] = server.users[userId]
+            }
             return data
         },
         getMultiplier: (member) => {
@@ -260,39 +122,27 @@ function makeTools({ db, getLevelImpl, banRoleId, multiplier } = {}) {
             return { multiplier: 1, role: 1, channel: 1, roleList: [], channelList: [] }
         },
         rng: () => 100,
-        getLevel,
-        xpForLevel: Tools.global.xpForLevel,
-        checkLevelRoles: (allRoles, roles, lvl, rewards) => {
-            const sorted = rewards.filter(r => r.level <= lvl).sort((a, b) => b.level - a.level)
-            const top = sorted[0]
-            const shouldHave = top ? sorted.filter(r => r.keep || r.level === top.level) : []
-            const current = rewards.filter(r => roles.has(r.id))
-            return {
-                current,
-                shouldHave,
-                correct: current.filter(r => shouldHave.some(s => s.id === r.id)),
-                incorrect: current.filter(r => !shouldHave.some(s => s.id === r.id)),
-                missing: shouldHave.filter(r => !current.some(c => c.id === r.id))
-            }
-        },
-        syncLevelRoles: async () => {}
+        // keep `this` bound to the real Tools instance (getLevel uses this.xpForLevel)
+        getLevel: (...args) => Tools.global.getLevel(...args),
+        checkLevelRoles: () => ({}),
+        syncLevelRoles: async function () { this.calls.push("sync"); },
+        calls: []
     }
 }
 
-function makeMember({ roles = [] } = {}) {
+function makeMember({ id = "u1", roles = [] } = {}) {
     const roleMap = new Map()
     roles.forEach((r, i) => {
-        const id = typeof r === "string" ? r : r.id
-        roleMap.set(id, { id, position: r.position ?? i })
+        const rid = typeof r === "string" ? r : r.id
+        roleMap.set(rid, { id: rid, position: i })
     })
     return {
-        id: "u1",
+        id,
         displayName: "User",
-        avatarLink: undefined,
         displayAvatarURL: () => "https://x.example/avatar.png",
         roles: {
             cache: roleMap,
-            has: id => roleMap.has(id),
+            has: rid => roleMap.has(rid),
             add: async () => {}
         }
     }
@@ -306,9 +156,8 @@ function makeMessage({ member, guildId = "g1" } = {}) {
         guild: {
             id: guildId,
             name: "Guild",
-            iconLink: undefined,
             iconURL: () => "https://x.example/icon.png",
-            roles: { cache: { get: id => guildRoles.find(r => r.id === id), find: fn => guildRoles.find(fn) } },
+            roles: { cache: { get: rid => guildRoles.find(r => r.id === rid), find: fn => guildRoles.find(fn) } },
             memberCount: 5
         },
         member,
@@ -316,86 +165,99 @@ function makeMessage({ member, guildId = "g1" } = {}) {
     }
 }
 
-function makeHarness(dbOverrides = {}) {
-    const oldDb = createFakeDb(dbOverrides)
-    const newDb = createFakeDb(dbOverrides)
-    const oldTools = makeTools({ db: oldDb, getLevelImpl: linearGetLevel })
-    const oldClient = { db: oldDb, monthlyMaintenance: async () => {} }
-    const oldMember = makeMember()
-    const oldMessage = makeMessage({ member: oldMember })
+// the handler fires one db.update without awaiting it: flush pending promises
+async function flush() {
+    await new Promise(resolve => setImmediate(resolve))
+    await new Promise(resolve => setImmediate(resolve))
+}
 
-    const newClient = { db: newDb, monthlyMaintenance: async () => {}, globalTools: new Tools(null) }
-    Object.assign(newClient, makeServerMetaMethods(newDb))
-    const newTools = newClient.globalTools
-    newTools.isDev = () => false
-    newTools.rng = () => 100
-    newTools.getMultiplier = oldTools.getMultiplier
-    newTools.checkLevelRoles = oldTools.checkLevelRoles
-    newTools.syncLevelRoles = async () => {}
-    const newMember = makeMember()
-    const newMessage = makeMessage({ member: newMember })
-
+function makeHarness(dbOverrides = {}, toolOpts = {}) {
+    const db = createFakeDb(dbOverrides)
+    const tools = makeTools(db, toolOpts)
+    const maintenanceCalls = []
+    const client = {
+        db,
+        monthlyMaintenance: async (guild, knownServer) => { maintenanceCalls.push({ guild, knownServer }) }
+    }
+    const member = makeMember({ roles: toolOpts.memberRoles || [] })
+    const message = makeMessage({ member })
     return {
-        runOld: () => runOld(oldClient, oldMessage, oldTools),
-        runNew: () => NewMessage.run(newClient, newMessage, newTools),
-        compare: () => assert.deepEqual(newDb.doc, oldDb.doc)
+        db,
+        tools,
+        maintenanceCalls,
+        run: async () => {
+            levelUpSends = 0
+            tools.calls.length = 0
+            await NewMessage.run(client, message, tools)
+            await flush()
+        }
     }
 }
 
-// patch LevelUpMessage.send so constructing level-up messages is safe in tests
-LevelUpMessage.prototype.send = function () {}
-LevelUpMessage.prototype.constructor.prototype.send = function () {}
-
-test("message flow: disabled server produces identical state", async () => {
+// ---------------------------------------------------------------
+// Behaviour tests
+// ---------------------------------------------------------------
+test("message flow: disabled server writes nothing", async () => {
     const h = makeHarness({ enabled: false })
-    await h.runOld()
-    await h.runNew()
-    h.compare()
+    const before = deepClone(h.db.doc)
+    await h.run()
+    assert.deepEqual(h.db.doc, before)
+    assert.equal(h.maintenanceCalls.length, 0)
 })
 
-test("message flow: first message grants xp identically", async () => {
+test("message flow: first message grants xp and bumps counters", async () => {
     const h = makeHarness()
-    await h.runOld()
-    await h.runNew()
-    h.compare()
+    await h.run()
+    const user = h.db.doc.users.u1
+    assert.equal(user.messages, 1)
+    assert.equal(user.monthlyMessages, 1)
+    assert.equal(user.xp, 100) // rng() is stubbed to 100
+    assert.equal(user.monthlyXP, 100)
+    assert.equal(user.cooldown, NOW + 60 * 1000)
+    assert.equal(user.hidden, false)
 })
 
-test("message flow: cooldown blocks the second message identically", async () => {
+test("message flow: maintenance receives the full server document", async () => {
+    const h = makeHarness({
+        users: {
+            u1: { xp: 10, cooldown: 0 },
+            u2: { xp: 20, cooldown: 0 },
+            u3: { xp: 30, cooldown: 0 }
+        },
+        info: { lastUpdate: 0, monthlyMessagesPeriod: "2026-09", monthlyTop: {} }
+    })
+    await h.run()
+    assert.equal(h.maintenanceCalls.length, 1)
+    const known = h.maintenanceCalls[0].knownServer
+    // must be the whole document (all users + info), not a projection:
+    // otherwise maintenance can't compare periods or snapshot the month
+    assert.deepEqual(Object.keys(known.users).sort(), ["u1", "u2", "u3"])
+    assert.equal(known.info.monthlyMessagesPeriod, "2026-09")
+})
+
+test("message flow: cooldown blocks xp on the second message", async () => {
     const h = makeHarness()
-    await h.runOld()
-    await h.runNew()
-    h.compare()
-    // second message falls inside the cooldown in both
-    await h.runOld()
-    await h.runNew()
-    h.compare()
+    await h.run()
+    await h.run()
+    const user = h.db.doc.users.u1
+    assert.equal(user.messages, 2)
+    assert.equal(user.monthlyMessages, 2)
+    assert.equal(user.xp, 100) // no extra xp inside the cooldown
+    assert.equal(user.monthlyXP, 100)
 })
 
-test("message flow: 0x ban role blocks xp identically", async () => {
-    const oldDb = createFakeDb({})
-    const newDb = createFakeDb({})
-    const oldTools = makeTools({ db: oldDb, getLevelImpl: linearGetLevel, banRoleId: "r_ban" })
-    const oldClient = { db: oldDb, monthlyMaintenance: async () => {} }
-    const oldMember = makeMember({ roles: ["r_ban"] })
-    await runOld(oldClient, makeMessage({ member: oldMember }), oldTools)
-
-    const newClient = { db: newDb, monthlyMaintenance: async () => {}, globalTools: new Tools(null) }
-    Object.assign(newClient, makeServerMetaMethods(newDb))
-    const nt = newClient.globalTools
-    nt.isDev = () => false
-    nt.rng = () => 100
-    nt.getMultiplier = oldTools.getMultiplier
-    nt.checkLevelRoles = oldTools.checkLevelRoles
-    nt.syncLevelRoles = async () => {}
-    const newMember = makeMember({ roles: ["r_ban"] })
-    await NewMessage.run(newClient, makeMessage({ member: newMember }), nt)
-
-    assert.deepEqual(newDb.doc, oldDb.doc)
-    assert.equal(newDb.doc.users.u1.xp || 0, 0)
+test("message flow: 0x ban role blocks xp but still counts the message", async () => {
+    const h = makeHarness({}, { banRoleId: "r_ban", memberRoles: ["r_ban"] })
+    await h.run()
+    const user = h.db.doc.users.u1
+    assert.equal(user.messages, 1)
+    assert.equal(user.monthlyMessages, 1)
+    assert.equal(user.xp || 0, 0)
+    assert.equal(user.monthlyXP || 0, 0)
 })
 
-test("message flow: crossing a level matches identically", async () => {
-    const db = {
+test("message flow: crossing a level sends the level-up message and syncs roles", async () => {
+    const h = makeHarness({
         settings: {
             maxLevel: 10,
             gain: { min: 100, max: 100, time: 0 },
@@ -406,16 +268,18 @@ test("message flow: crossing a level matches identically", async () => {
             rewards: [{ id: "r_reward", level: 1 }]
         },
         users: { u1: { xp: 50, cooldown: 0 } }
-    }
-    const h = makeHarness(db)
-    await h.runOld()
-    await h.runNew()
-    h.compare()
+    })
+    await h.run()
+    const user = h.db.doc.users.u1
+    assert.equal(user.xp, 150)
+    assert.equal(Tools.global.getLevel(50, h.db.doc.settings), 0)
+    assert.equal(Tools.global.getLevel(150, h.db.doc.settings), 1)
+    assert.equal(levelUpSends, 1)
+    assert.ok(h.tools.calls.includes("sync"))
 })
 
-test("message flow: hidden user gets unhidden identically", async () => {
+test("message flow: hidden user gets unhidden", async () => {
     const h = makeHarness({ users: { u1: { xp: 0, cooldown: 0, hidden: true } } })
-    await h.runOld()
-    await h.runNew()
-    h.compare()
+    await h.run()
+    assert.equal(h.db.doc.users.u1.hidden, false)
 })

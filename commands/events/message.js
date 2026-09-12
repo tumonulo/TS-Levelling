@@ -7,21 +7,21 @@ async run(client, message, tools) {
 
     if (config.lockBotToDevOnly && !tools.isDev(message.author)) return
 
-    // server settings are cached (15s TTL) and cheap to read, so this hot path
-    // only does one small query per message instead of two full document fetches
+    // fetch server xp settings fresh from the db on every message,
+    // so settings changes always apply immediately (no caching here)
     const author = message.author.id
-    let data = await client.fetchMessageData(message.guild.id)
-    if (!data.settings?.enabled) return
+    let db = await tools.fetchSettings(author, message.guild.id)
+    if (!db || !db.settings?.enabled) return
 
-    await client.monthlyMaintenance(message.guild, data.full)
+    // pass the full server document so monthly maintenance can compare
+    // periods and snapshot all users without extra reads or spurious writes
+    await client.monthlyMaintenance(message.guild, await client.db.fetch(message.guild.id).exec())
+    db = await tools.fetchSettings(author, message.guild.id)
 
-    let settings = data.settings
+    let settings = db.settings
 
-    // fetch the user's xp (already loaded on a cache miss, otherwise a single-user projection)
-    let userData
-    if (data.full) userData = data.full.users?.[author]
-    else userData = (await client.fetchUserData(message.guild.id, author))?.users?.[author]
-    if (!userData) userData = { xp: 0, cooldown: 0 }
+    // fetch user's xp, or give them 0
+    let userData = db.users[author] || { xp: 0, cooldown: 0 }
 
     await client.db.update(message.guild.id, { 
         $inc: {
