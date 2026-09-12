@@ -1,7 +1,27 @@
-TLDR: Do whatever you want as long as it's not for profit or commercial use.
+Copyright (c) 2026 tumonulo
 
-- You are free to use, fork, modify, distribute, and steal code snippets from this project
-- You may NOT use this project for commercial purposes. This includes selling the bot, or incorporating monetized features.
-- Please credit me (Colon) when you use this project, especially if your bot/fork is public
+All rights reserved.
 
-Polaris is provided "as-is", without any kind of warranty or guarantees regarding its functionality. If you use this code, you're doing so at your own risk and are responsible for any functionality, data, legal, or other issues that arise. It's your problem, not mine.
+This project and its source code are the property of the copyright holder.
+
+Permission is granted to view and study the source code for personal,
+educational, and learning purposes.
+
+You may not, without prior written permission from the copyright holder:
+
+* Use this source code, in whole or in part, in another project or bot.
+* Deploy or host this project, or any modified version of it, on a server.
+* Copy, redistribute, republish, or sell the source code or any modified version.
+* Create or distribute forks or derivative versions intended for use by others.
+* Present any part of this project or its source code as your own.
+* Remove or modify copyright notices or attribution.
+
+You are welcome to study the code, learn from its implementation, and use
+it as a reference for your own learning.
+
+Any use not explicitly permitted by this license requires prior written
+permission from the copyright holder.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
