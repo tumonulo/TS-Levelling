@@ -69,6 +69,7 @@ async run(client, int, tools, modal) {
     if (newValue === undefined || newValue == oldValue) return int.deferUpdate()
 
     client.db.update(int.guild.id, { $set: { [`settings.${settingID}`]: newValue, 'info.lastUpdate': Date.now() }}).then(() => {
+        client.invalidateServerCache(int.guild.id)
         client.commands.get("button:settings_view").run(client, int, tools, ["val", null, settingID])
     }).catch(() => tools.warn("Something went wrong while trying to change this setting!"))
 

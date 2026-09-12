@@ -60,18 +60,24 @@ class Tools {
             })
         }
 
-        // calculates current level from xp
+        // calculates current level from xp (binary search instead of a linear scan)
         this.getLevel = function(xp, settings, returnRequirement) {
-            let lvl = 0
-            let previousLevel = 0
-            let xpRequired = 0                
-            while (xp >= xpRequired && lvl <= settings.maxLevel) {  // cubic formula my ass, here's a while loop. could probably binary search this?
-                lvl++
-                previousLevel = xpRequired
-                xpRequired = this.xpForLevel(lvl, settings)
+            if (xp < 0) xp = 0
+            let low = 0
+            let high = settings.maxLevel
+            while (low <= high) {
+                const mid = Math.floor((low + high) / 2)
+                if (this.xpForLevel(mid, settings) <= xp) low = mid + 1
+                else high = mid - 1
             }
-            lvl--
-            return returnRequirement ? { level: lvl, xpRequired, previousLevel } : lvl
+            // low is the first level whose requirement exceeds xp (capped above maxLevel)
+            const level = Math.min(Math.max(low - 1, 0), settings.maxLevel)
+            if (!returnRequirement) return level
+            return {
+                level,
+                xpRequired: this.xpForLevel(level + 1, settings),
+                previousLevel: this.xpForLevel(level, settings)
+            }
         }
 
         this.getMessages = function(userData) {

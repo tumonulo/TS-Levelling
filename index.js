@@ -1,7 +1,9 @@
+require('dotenv').config()
 const Discord = require("discord.js")
 const fs = require("fs")
 
 const config = require("./config.json")
+const mongoose = require("mongoose")
 
 const Tools = require("./classes/Tools.js")
 const Model = require("./classes/DatabaseModel.js")
@@ -71,6 +73,52 @@ client.globalTools = new Tools(client);
 
 // connect to db
 client.db = new Model("servers", require("./database_schema.js").schema)
+
+// cached server settings for the message hot path (keeps the full users out of memory)
+const serverMetaCache = new Map()
+const serverMetaTTL = 15 * 1000
+
+function getCachedServerMeta(guildId) {
+    const entry = serverMetaCache.get(guildId)
+    if (!entry) return null
+    if (Date.now() - entry.timestamp >= serverMetaTTL) {
+        serverMetaCache.delete(guildId)
+        return null
+    }
+    return entry.meta
+}
+
+// fetches (or serves from cache) the settings/info used on the message hot path
+async function fetchMessageData(guildId) {
+    const cached = getCachedServerMeta(guildId)
+    if (cached) return { settings: cached.settings, info: cached.info, users: undefined, full: null }
+
+    let server = await client.db.fetch(guildId).exec()
+    if (!server) {
+        await client.db.create({ _id: guildId })
+        server = await client.db.fetch(guildId).exec()
+    }
+    serverMetaCache.set(guildId, { timestamp: Date.now(), meta: { settings: server?.settings, info: server?.info } })
+    return { settings: server?.settings, info: server?.info, users: server?.users, full: server }
+}
+
+// fetches a single user's data without pulling the whole server document
+async function fetchUserData(guildId, userId) {
+    return client.db.fetch(guildId, { [`users.${userId}`]: 1 }).exec()
+}
+
+client.fetchMessageData = fetchMessageData
+client.fetchUserData = fetchUserData
+client.getCachedServerMeta = getCachedServerMeta
+
+// drop the cached settings so a settings change applies immediately
+client.invalidateServerCache = guildId => serverMetaCache.delete(guildId)
+
+// keep the cached period in sync right after a monthly rollover
+function applyCachedPeriod(guildId, period) {
+    const meta = getCachedServerMeta(guildId)
+    if (meta) meta.info = { ...(meta.info || {}), monthlyMessagesPeriod: period }
+}
 
 function wait(milliseconds) {
     return new Promise(resolve => setTimeout(resolve, milliseconds))
@@ -268,10 +316,16 @@ async function processMonthlyMessages(guild, knownServer, knownMembers) {
     monthlyMaintenanceLocks.add(guild.id)
 
     try {
+        const currentPeriod = getMadridMonth()
+        // skip the DB entirely while the cached period is still current
+        if (!knownServer) {
+            const cached = getCachedServerMeta(guild.id)
+            if (cached?.info?.monthlyMessagesPeriod === currentPeriod) return
+        }
+
         const server = knownServer || await client.db.fetch(guild.id).exec()
         if (!server?.users) return
 
-        const currentPeriod = getMadridMonth()
         const previousPeriod = server.info?.monthlyMessagesPeriod
         if (previousPeriod === currentPeriod) return
 
@@ -281,6 +335,7 @@ async function processMonthlyMessages(guild, knownServer, knownMembers) {
             await client.db.update(guild.id, {
                 $set: { "info.monthlyMessagesPeriod": currentPeriod }
             }).exec()
+            applyCachedPeriod(guild.id, currentPeriod)
             return
         }
 
@@ -305,6 +360,7 @@ async function processMonthlyMessages(guild, knownServer, knownMembers) {
                 "info.monthlyTop": { period: previousPeriod, ...monthlyTop }
             }
         }).exec()
+        applyCachedPeriod(guild.id, currentPeriod)
     } finally {
         monthlyMaintenanceLocks.delete(guild.id)
     }
@@ -534,5 +590,17 @@ client.on('warn', e => console.warn(e))
 
 process.on('uncaughtException', e => console.warn(e))
 process.on('unhandledRejection', (e, p) => console.warn(e))
+
+// graceful shutdown: disconnect db and client before exiting
+function shutdown(signal) {
+    console.info(`Received ${signal}, shutting down gracefully...`)
+    Promise.all([
+        client.destroy().catch(() => {}),
+        Promise.resolve().then(() => mongoose.disconnect()).catch(() => {})
+    ]).finally(() => process.exit(0))
+    setTimeout(() => process.exit(1), 10_000).unref()
+}
+process.on('SIGINT', () => shutdown('SIGINT'))
+process.on('SIGTERM', () => shutdown('SIGTERM'))
 
 client.login(process.env.DISCORD_TOKEN)

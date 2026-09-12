@@ -34,6 +34,7 @@ async run(client, int, tools) {
         let viewRewardRoles = tools.row(tools.button({style: "Primary", label: `View all rewards (${newRoles.length})`, customId: "list_reward_roles"}))
 
         client.db.update(int.guild.id, { $set: { 'settings.rewards': newRoles, 'info.lastUpdate': Date.now() }}).then(() => {
+            client.invalidateServerCache(int.guild.id)
             return int.reply({ content: msg, components: viewRewardRoles })        
         })
     }

@@ -303,6 +303,7 @@ app.post("/api/settings", async function(req, res) {
 
     if (req.body.resetSettings) {
         return client.db.update(guildID, { $unset: { "settings": "x" }, $set: { "info.lastUpdate": Date.now() } }).exec().then(() => {
+            client.invalidateServerCache(guildID)
             return res.end("All settings reset!")
         }).catch(console.error)
     }
@@ -357,6 +358,7 @@ app.post("/api/settings", async function(req, res) {
     dbObj['info.lastUpdate'] = Date.now()
 
     client.db.update(guildID, { $set: dbObj }).exec().then(() => {
+        client.invalidateServerCache(guildID)
         return res.end("cool and good")
     }).catch(console.error)
 
@@ -532,6 +534,7 @@ app.post("/api/importfrombot", async function(req, res) {
     else {
         client.db.update(guildID, { $set: newData.data }).exec()
         .then(() => {
+            client.invalidateServerCache(guildID)
             importCooldowns[importCode] = Date.now() + 60000
             res.end("Successfully imported!\n" + (newData.details || []).map(x => "- " + x).join("\n"))
         })
